@@ -1,7 +1,8 @@
 import math
 import torch
 from torchdiffeq import odeint
-import torchcde
+from sde.interpolation_cubic import natural_cubic_spline_coeffs, CubicSpline
+from sde.solver import cdeint
 
 
 class ODEfunc(torch.nn.Module):
@@ -53,33 +54,21 @@ class ODEBlock(torch.nn.Module):
 
 class CDEBlock(torch.nn.Module):
 
-    def __init__(self, cdefunc, interpolation: str = "linear"):
+    def __init__(self, cdefunc):
         super().__init__()
         self.cdefunc = cdefunc
-        self.interpolation = interpolation
 
     def forward(self, x, integration_time):
-        x_and_t = torch.cat([integration_time[:-1].unsqueeze(0).unsqueeze(2),
-                             x.reshape(x.shape[0], -1).unsqueeze(0)],
-                            dim=2)
-        if self.interpolation == 'cubic':
-            coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x_and_t)
-            X = torchcde.CubicSpline(coeffs)
-        elif self.interpolation == 'linear':
-            coeffs = torchcde.linear_interpolation_coeffs(x_and_t)
-            X = torchcde.LinearInterpolation(coeffs)
-        else:
-            raise ValueError("Only 'linear' and 'cubic' interpolation methods are implemented.")
+        coeffs = natural_cubic_spline_coeffs(x, t=integration_time[:-1])
+        X = CubicSpline(coeffs, t=integration_time[:-1])
+        X0 = X.evaluate(X.interval[0]).unsqueeze(0)
+        assert len(x.shape) == len(X0.shape)
 
-        X0 = X.evaluate(X.interval[0]) #[:, 1:].reshape(1, 128, 256, 256)
+        t = integration_time.type_as(x)
+        adjoint_params = tuple(self.cdefunc.parameters()) + (coeffs,)
+        out = cdeint(X=X, z0=X0, func=self.cdefunc, t=t, adjoint_params=adjoint_params)
 
-        integration_time = integration_time.type_as(x)
-        import pdb
-        pdb.set_trace()
-        out = torchcde.cdeint(X=X, z0=X0, func=self.cdefunc, t=integration_time)
-        import pdb
-        pdb.set_trace()
-        return out[1]
+        return out[-1]
 
     @property
     def nfe(self):

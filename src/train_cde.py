@@ -13,7 +13,7 @@ import albumentations as A
 
 from util.prepare_dataset import prepare_dataset
 from util.attribute_hashmap import AttributeHashmap
-# from utils.metrics import psnr, ssim, dice_coeff, hausdorff
+from util.metrics import psnr, ssim, dice_coeff
 from util.seed import seed_everything
 
 from nn.scheduler import LinearWarmupCosineAnnealingLR
@@ -51,7 +51,7 @@ def train(config: AttributeHashmap):
                                               max_epochs=config.max_epochs)
 
     mse_loss = torch.nn.MSELoss()
-    best_val_psnr, best_val_dice = 0, 0
+    best_val_psnr = 0
     backprop_freq = config.batch_size
     if 'n_plot_per_epoch' not in config.keys():
         config.n_plot_per_epoch = 1
@@ -70,7 +70,7 @@ def train(config: AttributeHashmap):
 
         with ema.average_parameters():
             model.eval()
-            val_recon_psnr, val_pred_psnr, val_seg_dice_xT = \
+            val_recon_psnr, val_pred_psnr = \
                 val_epoch(config=config, device=device, val_set=val_set, model=model, epoch_idx=epoch_idx)
 
             if val_recon_psnr > recon_psnr_thr:
@@ -79,10 +79,6 @@ def train(config: AttributeHashmap):
             if val_pred_psnr > best_val_psnr:
                 best_val_psnr = val_pred_psnr
                 model.save_weights(config.model_save_path.replace('.pty', '_best_pred_psnr.pty'))
-
-            if val_seg_dice_xT > best_val_dice:
-                best_val_dice = val_seg_dice_xT
-                model.save_weights(config.model_save_path.replace('.pty', '_best_seg_dice.pty'))
 
     return
 
@@ -214,7 +210,6 @@ def val_epoch(config: AttributeHashmap,
               model: torch.nn.Module,
               epoch_idx: int):
     val_recon_psnr, val_recon_ssim, val_pred_psnr, val_pred_ssim = 0, 0, 0, 0
-    val_seg_dice_xT, val_seg_dice_gt = 0, 0
 
     plot_freq = int(len(val_set) // config.n_plot_per_epoch)
     for iter_idx, (images, timestamps) in enumerate(tqdm(val_set)):
@@ -231,13 +226,8 @@ def val_epoch(config: AttributeHashmap,
         x_end_recon = model(x=x_end, t=torch.zeros(1).to(device))
         x_end_pred = model(x=x_start, t=torch.diff(t_list) * config.t_multiplier)
 
-        x_start_seg = segmentor(x_start) > 0.5
-        x_end_seg = segmentor(x_end) > 0.5
-        x_end_pred_seg = segmentor(x_end_pred) > 0.5
-
-        x0_true, x0_recon, xT_true, xT_recon, xT_pred, x0_seg, xT_seg, xT_pred_seg = \
-            numpy_variables(x_start, x_start_recon, x_end, x_end_recon, x_end_pred,
-                            x_start_seg, x_end_seg, x_end_pred_seg)
+        x0_true, x0_recon, xT_true, xT_recon, xT_pred = \
+            numpy_variables(x_start, x_start_recon, x_end, x_end_recon, x_end_pred)
 
         # NOTE: Convert to image with normal dynamic range.
         x0_true, x0_recon, xT_true, xT_recon, xT_pred = \
@@ -248,28 +238,11 @@ def val_epoch(config: AttributeHashmap,
         val_pred_psnr += psnr(xT_true, xT_pred)
         val_pred_ssim += ssim(xT_true, xT_pred)
 
-        val_seg_dice_xT += dice_coeff(xT_seg, xT_pred_seg)
-        val_seg_dice_gt += dice_coeff(x0_seg, xT_seg)
-
-        if shall_plot:
-            save_path_fig_sbs = '%s/val/figure_log_epoch%s_sample%s.png' % (
-                config.save_folder, str(epoch_idx + 1).zfill(5), str(iter_idx + 1).zfill(5))
-            plot_side_by_side(t_list, x0_true, xT_true, x0_recon, xT_recon, xT_pred, save_path_fig_sbs,
-                              x0_true_seg=x0_seg, xT_pred_seg=xT_pred_seg, xT_true_seg=xT_seg)
-
-    del segmentor
-
-    val_recon_psnr, val_recon_ssim, val_pred_psnr, val_pred_ssim, val_seg_dice_xT, val_seg_dice_gt = \
+    val_recon_psnr, val_recon_ssim, val_pred_psnr, val_pred_ssim = \
         [item / len(val_set.dataset) for item in (
-            val_recon_psnr, val_recon_ssim, val_pred_psnr, val_pred_ssim, val_seg_dice_xT, val_seg_dice_gt)]
+            val_recon_psnr, val_recon_ssim, val_pred_psnr, val_pred_ssim)]
 
-    log('Validation [%s/%s] PSNR (recon): %.3f, SSIM (recon): %.3f, PSNR (pred): %.3f, SSIM (pred): %.3f, Dice(xT_true, xT_pred): %.3f, Dice(x0_true, xT_true): %.3f.'
-        % (epoch_idx + 1, config.max_epochs, val_recon_psnr,
-        val_recon_ssim, val_pred_psnr, val_pred_ssim, val_seg_dice_xT, val_seg_dice_gt),
-        filepath=config.log_dir,
-        to_console=False)
-
-    return val_recon_psnr, val_pred_psnr, val_seg_dice_xT
+    return val_recon_psnr, val_pred_psnr
 
 
 def convert_variables(images: torch.Tensor,
@@ -324,6 +297,7 @@ if __name__ == '__main__':
     parser.add_argument('--num-workers', default=0, type=int)
     parser.add_argument('--random-seed', default=1, type=int)
     parser.add_argument('--train-val-test-ratio', default='6:2:2', type=str)
+    parser.add_argument('--max-training-samples', default=1000, type=int)
     args = vars(parser.parse_args())
     config = AttributeHashmap(args)
 
@@ -340,4 +314,3 @@ if __name__ == '__main__':
 
     seed_everything(config.random_seed)
     train(config=config)
-    # test(config=config)
