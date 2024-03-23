@@ -7,7 +7,7 @@ from matplotlib import colormaps
 
 
 def _generate_longitudinal(image_shape: Tuple[int] = (256, 256),
-                           num_images: int = 10,
+                           num_images: int = 6,
                            initial_radius: Tuple[int] = (18, 16),
                            final_radius: Tuple[int] = (36, 48),
                            random_seed: int = None):
@@ -48,7 +48,7 @@ def _generate_longitudinal(image_shape: Tuple[int] = (256, 256),
     return images, square_centroid
 
 
-def synthesize_dataset(save_folder: str = '../data/synthesized/', num_subjects: int = 200):
+def synthesize_dataset(save_folder: str = '../data/synthesized/', num_subjects: int = 100):
     '''
     Synthesize 4 datasets.
     1. The first dataset has no spatial variation. It has pixel-level alignment temporally.

@@ -15,6 +15,7 @@ from util.prepare_dataset import prepare_dataset
 from util.attribute_hashmap import AttributeHashmap
 from util.metrics import psnr, ssim, dice_coeff
 from util.seed import seed_everything
+from util.log_util import log
 
 from nn.scheduler import LinearWarmupCosineAnnealingLR
 from nn.unet_cde_simple import CDEUNet
@@ -31,6 +32,8 @@ def train(config: AttributeHashmap):
 
     train_set, val_set, test_set, num_image_channel = \
         prepare_dataset(config=config)
+
+    log('Using device: %s' % device, to_console=True)
 
     # Build the model
     model = CDEUNet(device=device,
@@ -53,8 +56,6 @@ def train(config: AttributeHashmap):
     mse_loss = torch.nn.MSELoss()
     best_val_psnr = 0
     backprop_freq = config.batch_size
-    if 'n_plot_per_epoch' not in config.keys():
-        config.n_plot_per_epoch = 1
 
     os.makedirs(config.save_folder + 'train/', exist_ok=True)
     os.makedirs(config.save_folder + 'val/', exist_ok=True)
@@ -79,6 +80,9 @@ def train(config: AttributeHashmap):
             if val_pred_psnr > best_val_psnr:
                 best_val_psnr = val_pred_psnr
                 model.save_weights(config.model_save_path.replace('.pty', '_best_pred_psnr.pty'))
+                log('Model weights successfully saved for best pred PSNR.',
+                    filepath=config.log_dir,
+                    to_console=False)
 
     return
 
@@ -102,12 +106,21 @@ def train_epoch(config: AttributeHashmap,
     model.train()
     optimizer.zero_grad()
 
-    plot_freq = int(len(train_set) // config.n_plot_per_epoch)
+    if not train_time_dependent:
+        log('[Epoch %d] Will not train the time-dependent modules until the reconstruction is good enough.' % (epoch_idx + 1),
+            filepath=config.log_dir,
+            to_console=False)
+
+    if config.max_training_samples:
+        training_iters = min(len(train_set), config.max_training_samples)
+    else:
+        training_iters = len(train_set)
+
+    plot_freq = int(training_iters // config.n_plot_per_epoch)
     for iter_idx, (images, timestamps) in enumerate(tqdm(train_set)):
 
-        if 'max_training_samples' in config:
-            if iter_idx > config.max_training_samples:
-                break
+        if config.max_training_samples and iter_idx > config.max_training_samples:
+            break
 
         shall_plot = iter_idx % plot_freq == 0
 
@@ -124,16 +137,14 @@ def train_epoch(config: AttributeHashmap,
         x_list, t_arr = convert_variables(images, timestamps, device)
         x_noisy_list = [add_random_noise(x) for x in x_list]
 
-        x_end_pred = model(x=torch.vstack(x_noisy_list[:-1]), t=(t_arr - t_arr[0]) * config.t_multiplier)
-        import pdb
-        pdb.set_trace()
-
         ################### Recon Loss to update Encoder/Decoder ##################
         # Unfreeze the model.
         model.unfreeze()
 
-        x_start_recon = model(x=x_start_noisy, t=torch.zeros(1).to(device))
-        x_end_recon = model(x=x_end_noisy, t=torch.zeros(1).to(device))
+        x_start = x_list[0]
+        x_end = x_list[-1]
+        x_start_recon = model(x=x_noisy_list[0], t=torch.zeros(1).to(device))
+        x_end_recon = model(x=x_noisy_list[-1], t=torch.zeros(1).to(device))
 
         loss_recon = mse_loss(x_start, x_start_recon) + mse_loss(x_end, x_end_recon)
         train_loss_recon += loss_recon.item()
@@ -150,8 +161,7 @@ def train_epoch(config: AttributeHashmap,
             print('`model.freeze_time_independent()` ignored.')
 
         if train_time_dependent:
-            assert torch.diff(t_list).item() > 0
-            x_end_pred = model(x=x_start_noisy, t=torch.diff(t_list) * config.t_multiplier)
+            x_end_pred = model(x=torch.vstack(x_noisy_list[:-1]), t=(t_arr - t_arr[0]) * config.t_multiplier)
             loss_pred = mse_loss(x_end, x_end_pred)
             train_loss_pred += loss_pred.item()
 
@@ -162,7 +172,7 @@ def train_epoch(config: AttributeHashmap,
         else:
             # Will not train the time-dependent modules until the reconstruction is good enough.
             with torch.no_grad():
-                x_end_pred = model(x=x_start_noisy, t=torch.diff(t_list) * config.t_multiplier)
+                x_end_pred = model(x=torch.vstack(x_noisy_list[:-1]), t=(t_arr - t_arr[0]) * config.t_multiplier)
                 loss_pred = mse_loss(x_end, x_end_pred)
                 train_loss_pred += loss_pred.item()
 
@@ -187,7 +197,7 @@ def train_epoch(config: AttributeHashmap,
         if shall_plot:
             save_path_fig_sbs = '%s/train/figure_log_epoch%s_sample%s.png' % (
                 config.save_folder, str(epoch_idx + 1).zfill(5), str(iter_idx + 1).zfill(5))
-            plot_side_by_side(t_list, x0_true, xT_true, x0_recon, xT_recon, xT_pred, save_path_fig_sbs)
+            plot_side_by_side(t_arr, x0_true, xT_true, x0_recon, xT_recon, xT_pred, save_path_fig_sbs)
 
     train_loss_pred, train_loss_recon, train_recon_psnr, train_recon_ssim, train_pred_psnr, train_pred_ssim = \
         [item / len(train_set.dataset) for item in (train_loss_pred, train_loss_recon, train_recon_psnr, train_recon_ssim, train_pred_psnr, train_pred_ssim)]
@@ -215,16 +225,16 @@ def val_epoch(config: AttributeHashmap,
     for iter_idx, (images, timestamps) in enumerate(tqdm(val_set)):
         shall_plot = iter_idx % plot_freq == 0
 
-        assert images.shape[1] == 2
-        assert timestamps.shape[1] == 2
+        assert images.shape[1] >= 2
+        assert timestamps.shape[1] >= 2
 
-        # images: [1, 2, C, H, W], containing [x_start, x_end]
-        # timestamps: [1, 2], containing [t_start, t_end]
-        x_start, x_end, t_list = convert_variables(images, timestamps, device)
+        x_list, t_arr = convert_variables(images, timestamps, device)
 
+        x_start = x_list[0]
+        x_end = x_list[-1]
         x_start_recon = model(x=x_start, t=torch.zeros(1).to(device))
         x_end_recon = model(x=x_end, t=torch.zeros(1).to(device))
-        x_end_pred = model(x=x_start, t=torch.diff(t_list) * config.t_multiplier)
+        x_end_pred = model(x=torch.vstack(x_list[:-1]), t=(t_arr - t_arr[0]) * config.t_multiplier)
 
         x0_true, x0_recon, xT_true, xT_recon, xT_pred = \
             numpy_variables(x_start, x_start_recon, x_end, x_end_recon, x_end_pred)
@@ -238,11 +248,89 @@ def val_epoch(config: AttributeHashmap,
         val_pred_psnr += psnr(xT_true, xT_pred)
         val_pred_ssim += ssim(xT_true, xT_pred)
 
+        if shall_plot:
+            save_path_fig_sbs = '%s/val/figure_log_epoch%s_sample%s.png' % (
+                config.save_folder, str(epoch_idx + 1).zfill(5), str(iter_idx + 1).zfill(5))
+            plot_side_by_side(t_arr, x0_true, xT_true, x0_recon, xT_recon, xT_pred, save_path_fig_sbs)
+
     val_recon_psnr, val_recon_ssim, val_pred_psnr, val_pred_ssim = \
         [item / len(val_set.dataset) for item in (
             val_recon_psnr, val_recon_ssim, val_pred_psnr, val_pred_ssim)]
 
+    log('Validation [%s/%s] PSNR (recon): %.3f, SSIM (recon): %.3f, PSNR (pred): %.3f, SSIM (pred): %.3f.'
+        % (epoch_idx + 1, config.max_epochs, val_recon_psnr,
+        val_recon_ssim, val_pred_psnr, val_pred_ssim),
+        filepath=config.log_dir,
+        to_console=False)
+
     return val_recon_psnr, val_pred_psnr
+
+
+def plot_side_by_side(t_list, x0_true, xT_true, x0_recon, xT_recon, xT_pred, save_path: str) -> None:
+    fig_sbs = plt.figure(figsize=(16, 10))
+    plt.rcParams['font.family'] = 'serif'
+
+    aspect_ratio = x0_true.shape[0] / x0_true.shape[1]
+
+    assert len(x0_true.shape) in [2, 3]
+    if len(x0_true.shape) == 2 or x0_true.shape[-1] == 1:
+        x0_true, xT_true, x0_recon, xT_recon, xT_pred = \
+            gray_to_rgb(x0_true, xT_true, x0_recon, xT_recon, xT_pred)
+
+    # First column: Ground Truth.
+    ax = fig_sbs.add_subplot(2, 4, 1)
+    ax.imshow(x0_true)
+    ax.set_title('GT(t=0), time: %s\n[vs GT(t=T)]: PSNR=%.2f, SSIM=%.3f' % (
+        t_list[0].item(), psnr(x0_true, xT_true), ssim(x0_true, xT_true)))
+    ax.set_axis_off()
+    ax.set_aspect(aspect_ratio)
+    ax = fig_sbs.add_subplot(2, 4, 5)
+    ax.imshow(xT_true)
+    ax.set_title('GT(t=T), time: %s' % t_list[-1].item())
+    ax.set_axis_off()
+    ax.set_aspect(aspect_ratio)
+
+    # Second column: Reconstruction.
+    ax = fig_sbs.add_subplot(2, 4, 2)
+    ax.imshow(x0_recon)
+    ax.set_title('Recon(t=0), time: %s' % t_list[0].item())
+    ax.set_axis_off()
+    ax.set_aspect(aspect_ratio)
+    ax = fig_sbs.add_subplot(2, 4, 6)
+    ax.imshow(xT_recon)
+    ax.set_title('Recon(t=T), time: %s' % t_list[-1].item())
+    ax.set_axis_off()
+    ax.set_aspect(aspect_ratio)
+
+    # Third column: Prediction.
+    ax = fig_sbs.add_subplot(2, 4, 3)
+    ax.set_axis_off()
+    ax.set_aspect(aspect_ratio)
+    ax = fig_sbs.add_subplot(2, 4, 7)
+    ax.imshow(xT_pred)
+    ax.set_title('Pred(t=T), time: %s -> time: %s\n[vs GT(t=T)]: PSNR=%.2f, SSIM=%.3f' % (
+        list(t_list[:-1].cpu().detach().numpy()), t_list[-1].item(), psnr(xT_pred, xT_true), ssim(xT_pred, xT_true)))
+    ax.set_axis_off()
+    ax.set_aspect(aspect_ratio)
+
+    # Fourth column: |Ground Truth t1 - Ground Truth t2|, |Ground Truth - Prediction|.
+    ax = fig_sbs.add_subplot(2, 4, 4)
+    ax.imshow(np.abs(x0_true - xT_true))
+    ax.set_title('|GT(t=0) - GT(t=T)|, time: %s and %s\n[MAE=%.4f, MSE=%.4f]' % (
+        t_list[0].item(), t_list[-1].item(), np.mean(np.abs(x0_true - xT_true)), np.mean((x0_true - xT_true)**2)))
+    ax.set_axis_off()
+    ax.set_aspect(aspect_ratio)
+    ax = fig_sbs.add_subplot(2, 4, 8)
+    ax.imshow(np.abs(xT_pred - xT_true))
+    ax.set_title('|Pred(t=T) - GT(t=T)|, time: %s\n[MAE=%.4f, MSE=%.4f]' % (
+        t_list[-1].item(), np.mean(np.abs(xT_pred - xT_true)), np.mean((xT_pred - xT_true)**2)))
+    ax.set_axis_off()
+    ax.set_aspect(aspect_ratio)
+
+    fig_sbs.tight_layout()
+    fig_sbs.savefig(save_path)
+    plt.close(fig=fig_sbs)
+    return
 
 
 def convert_variables(images: torch.Tensor,
@@ -288,16 +376,18 @@ if __name__ == '__main__':
     parser.add_argument('--dataset-path', default=os.path.abspath('../data/synthesized/'), type=str)
     parser.add_argument('--image-folder', default='base', type=str)
     parser.add_argument('--output-save-path', default=os.path.abspath('../results/synthesized/base/'), type=str)
-    parser.add_argument('--learning-rate', default=1e-4, type=float)
+    parser.add_argument('--learning-rate', default=1e-3, type=float)
     parser.add_argument('--max-epochs', default=100, type=int)
-    parser.add_argument('--batch-size', default=64, type=int)
+    parser.add_argument('--batch-size', default=16, type=int)
     parser.add_argument('--num-filters', default=16, type=int)
     parser.add_argument('--depth', default=5, type=int)
     parser.add_argument('--t-multiplier', default=0.1, type=float)
-    parser.add_argument('--num-workers', default=0, type=int)
+    parser.add_argument('--num-workers', default=8, type=int)
     parser.add_argument('--random-seed', default=1, type=int)
-    parser.add_argument('--train-val-test-ratio', default='6:2:2', type=str)
-    parser.add_argument('--max-training-samples', default=1000, type=int)
+    parser.add_argument('--train-val-test-ratio', default='18:1:1', type=str)
+    parser.add_argument('--max-training-samples', default=2560, type=int)
+    parser.add_argument('--n-plot-per-epoch', default=5, type=int)
+
     args = vars(parser.parse_args())
     config = AttributeHashmap(args)
 
@@ -311,6 +401,14 @@ if __name__ == '__main__':
             run_count = 1
     config.save_folder = '%s/run_%d/' % (config.output_save_path, run_count)
     config.model_save_path = config.save_folder + config.output_save_path.split('/')[-2] + '.pty'
+
+    # Initialize log file.
+    config.log_dir = config.save_folder + 'log.txt'
+    log_str = 'Config: \n'
+    for key in config.keys():
+        log_str += '%s: %s\n' % (key, config[key])
+    log_str += '\nTraining History:'
+    log(log_str, filepath=config.log_dir, to_console=True)
 
     seed_everything(config.random_seed)
     train(config=config)

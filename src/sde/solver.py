@@ -6,6 +6,11 @@ import warnings
 
 class _VectorField(torch.nn.Module):
     def __init__(self, X, func):
+        '''
+        X is the natural cubic spline with knots at t_0,...,t_n such that X_{t_i} = (x_i, t_i).
+        As x is often assumed to be a discretisation of an underlying process, observed only through x,
+        then X is an approximation to this underlying process.
+        '''
         super().__init__()
 
         self.X = X
@@ -30,7 +35,7 @@ class _VectorField(torch.nn.Module):
         # we are trying to do
         # \mathbb{R}^{c x h x w} -> \mathbb{R}^{c x h x w}
         # which cannot be simply solved by a matrix multiplication.
-        out = (vector_field * control_gradient.unsqueeze(0)).squeeze(0)
+        out = (vector_field * control_gradient.unsqueeze(0))
 
         return out
 

@@ -77,11 +77,11 @@ class CDEUNet(BaseNetwork):
             self.pooling = torch.nn.MaxPool2d(2)
 
         # This is for the decoder.
-        self.ode_list = torch.nn.ModuleList([])
+        self.cde_list = torch.nn.ModuleList([])
         self.up_list = torch.nn.ModuleList([])
         self.up_conn_list = torch.nn.ModuleList([])
         for d in range(self.depth):
-            self.ode_list.append(CDEBlock(ODEfunc(dim=n_f * 2 ** d)))
+            self.cde_list.append(CDEBlock(ODEfunc(dim=n_f * 2 ** d)))
             self.up_list.append(upconv_block(n_f * 2 ** d))
             if self.use_bn:
                 self.up_conn_list.append(torch.nn.Sequential(
@@ -90,7 +90,7 @@ class CDEUNet(BaseNetwork):
                 ))
             else:
                 self.up_conn_list.append(torch.nn.Conv2d(n_f * 3 * 2 ** d, n_f * 2 ** d, 1, 1))
-        self.ode_list = self.ode_list[::-1]
+        self.cde_list = self.cde_list[::-1]
         self.up_list = self.up_list[::-1]
         self.up_conn_list = self.up_conn_list[::-1]
 
@@ -101,7 +101,7 @@ class CDEUNet(BaseNetwork):
         '''
         Parameters related to ODE.
         '''
-        return set(self.parameters()) - set(self.ode_list.parameters()) - set(self.cde_bottleneck.parameters())
+        return set(self.parameters()) - set(self.cde_list.parameters()) - set(self.cde_bottleneck.parameters())
 
     def freeze_time_independent(self):
         '''
@@ -146,7 +146,7 @@ class CDEUNet(BaseNetwork):
                                                 mode='bilinear',
                                                 align_corners=False)
             if use_cde:
-                res = self.ode_list[d](residual_list.pop(-1), integration_time)
+                res = self.cde_list[d](residual_list.pop(-1), integration_time)
             else:
                 res = residual_list.pop(-1)
             x = torch.cat([x, res], dim=1)

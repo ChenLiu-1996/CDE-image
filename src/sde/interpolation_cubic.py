@@ -15,8 +15,10 @@ def _natural_cubic_spline_coeffs_without_missing_values(x, t):
     length = t.shape[0]
 
     if length < 2:
-        # In practice this should always already be caught in __init__.
-        raise ValueError("Must have a time dimension of size at least 2.")
+        a = x[:1, ...]
+        b = torch.zeros(1, *x.shape[1:], dtype=x.dtype, device=x.device)
+        two_c = torch.zeros(1, *x.shape[1:], dtype=x.dtype, device=x.device)
+        three_d = torch.zeros(1, *x.shape[1:], dtype=x.dtype, device=x.device)
 
     elif length == 2:
         a = x[:1, ...]
